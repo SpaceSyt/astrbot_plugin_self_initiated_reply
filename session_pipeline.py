@@ -18,6 +18,7 @@ from .models import (
     AttemptLedger,
     AttemptState,
     LedgerPhase,
+    ReplyTarget,
     SessionState,
     Settings,
     now_ts,
@@ -187,7 +188,10 @@ class SessionPipeline:
         observed_active_at = state.last_active_at
 
         state.refresh_day()
-        gate = self._decision.local_gate(state, force=force)
+        decision_kwargs = (
+            {"checking": True} if self._settings.decision_backend == "decisions" else {}
+        )
+        gate = self._decision.local_gate(state, force=force, **decision_kwargs)
         if gate:
             # 与判断路径同一套登记：网关拦截（冷却/日配额/静默不足/观察窗口）必须
             # 进 ``last_decisions``，否则 `/selfreply status` 的「最近裁决」会显示
@@ -222,6 +226,22 @@ class SessionPipeline:
             if isinstance(decision, str):
                 return decision
 
+            if self._settings.decision_backend == "decisions":
+                gate = self._decision.local_gate(state, force=force)
+                if gate:
+                    record_decision(
+                        self._last_decisions, umo, trigger, should_reply=False, reason=gate
+                    )
+                    return gate
+
+            target = decision.get("target")
+            if target is not None and (
+                not isinstance(target, ReplyTarget)
+                or not target.valid_for(umo, now_ts())
+                or not any(item is target for item in state.reply_targets)
+            ):
+                return "选中的消息已失效。"
+            target_kwargs = {"target": target} if target is not None else {}
             reply_text, reply_ledger = await self._generation.generate(
                 umo,
                 state,
@@ -229,6 +249,7 @@ class SessionPipeline:
                 ledger=ledger,
                 force=force,
                 silence_active_at=observed_active_at,
+                **target_kwargs,
             )
             if reply_ledger is not None and reply_ledger is not ledger:
                 raise RuntimeError("generation returned a different attempt ledger")
@@ -260,6 +281,7 @@ class SessionPipeline:
                 silence_active_at=observed_active_at,
                 # 判断模型给出的引用决定（None = 未表态，由投递侧按模式兜底）
                 quote=decision.get("quote"),
+                **target_kwargs,
             )
         finally:
             try:
@@ -279,6 +301,12 @@ class SessionPipeline:
                     await asyncio.shield(finalizer)
                     raise
             finally:
+                if self._settings.decision_backend == "decisions":
+                    # Consume this snapshot even when Decisions chose silence. New
+                    # messages arriving during the check belong to the next batch.
+                    state.last_proactive_observed_at = max(
+                        state.last_proactive_observed_at, observed_active_at
+                    )
                 # unmark 挂在最外层：finalizer 抛错的路径同样必经，
                 # 否则会话永久卡在 running。
                 self._gate.unmark_running(umo)

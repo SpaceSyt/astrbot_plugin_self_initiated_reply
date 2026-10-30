@@ -5,6 +5,38 @@
     "hint": "关闭后不监听、不判断、不主动发送。",
     "default": true
   },
+  "decision_backend": {
+    "type": "string",
+    "description": "判断接口",
+    "default": "chat",
+    "options": ["chat", "decisions"],
+    "hint": "decisions 使用独立的 OpenAI Decisions API；正文仍由 AstrBot 生成。"
+  },
+  "decisions_base_url": {
+    "type": "string",
+    "description": "Decisions API 地址",
+    "default": "https://api.openai.com/v1",
+    "hint": "填写包含 /v1 的基础地址，接口必须支持 /decisions。"
+  },
+  "decisions_api_key_env": {
+    "type": "string",
+    "description": "Decisions 密钥环境变量名",
+    "default": "OPENAI_API_KEY",
+    "hint": "填写变量名，不要填写密钥。AstrBot 进程需能读取该环境变量。"
+  },
+  "decisions_interests": {
+    "type": "text",
+    "description": "角色兴趣与接话偏好",
+    "default": "",
+    "hint": "Decisions 模式必填；说明角色喜欢的话题和参与方式。"
+  },
+  "decisions_min_confidence": {
+    "type": "float",
+    "description": "Decisions 最低置信度",
+    "default": 0.7,
+    "slider": {"min": 0, "max": 1, "step": 0.05},
+    "hint": "低于此值保持沉默；0.7 是待回放校准的起点。"
+  },
   "decision_model_enabled": {
     "type": "bool",
     "description": "启用判断模型",
@@ -164,7 +196,7 @@
   "abandon_stale_on_new_message": {
     "type": "bool",
     "description": "新消息到达时放弃未发出的旧回复",
-    "hint": "默认关闭。开启后，同一会话里任何新消息都会让正在生成、尚未发出的主动回复作废（包括表情包、单独符号）。关闭后旧回复仍会发出，新消息只刷新延迟与下一轮静默计时。白名单移除、指令检查和插件停止仍会作废旧任务。",
+    "hint": "仅 chat 判断接口生效。Decisions 使用固定消息窗口，普通新消息不会推迟窗口或作废选中的回复；@、唤醒、白名单移除和停止仍会使旧任务失效。",
     "default": false
   },
   "skip_after_direct_call": {
@@ -198,8 +230,8 @@
   "message_delay_sec": {
     "type": "int",
     "description": "消息后延迟触发（秒）",
-    "hint": "白名单会话收到普通消息后等待多久再检查是否主动回应，避免马上插话。",
-    "default": 60,
+    "hint": "Decisions：从首条待处理消息计时，后续消息合并但不重置；到点判断，可保持沉默。连续接话窗口使用 5 秒。chat：按最后一条消息延迟。",
+    "default": 30,
     "slider": {
       "min": 5,
       "max": 86400,
@@ -209,7 +241,7 @@
   "min_silence_sec": {
     "type": "int",
     "description": "最小静默时间（秒）",
-    "hint": "距离该会话最后一条用户消息不足该时间时，不会主动回应。每个群聊独立计时。设为 0 表示不要求静默（收到消息后按「消息后延迟」到点即可能接话，是回复偏频繁的常见原因之一）。",
+    "hint": "仅 chat 判断接口生效。Decisions 到固定窗口截止时判断，不再等待群聊静默。",
     "default": 45,
     "slider": {
       "min": 0,

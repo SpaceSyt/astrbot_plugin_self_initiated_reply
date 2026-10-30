@@ -26,7 +26,7 @@ from typing import Any, Protocol
 from astrbot.api import logger
 
 PLUGIN_ID = "astrbot_plugin_self_initiated_reply"
-PLUGIN_VERSION = "1.5.1"
+PLUGIN_VERSION = "1.6.0"
 COMMAND_HANDLED_KEY = f"{PLUGIN_ID}:command_handled"
 STATE_VERSION = 4
 
@@ -438,6 +438,29 @@ class MessageRecord:
     at: float = field(default_factory=now_ts)
 
 
+@dataclass(frozen=True)
+class ReplyTarget:
+    """A bounded, in-memory message identity carried through one reply attempt."""
+
+    event: Any = field(repr=False, compare=False)
+    message_id: str
+    sender_id: str
+    text: str
+    name: str
+    umo: str
+    at: float
+
+    def valid_for(self, umo: str, now: float) -> bool:
+        """Reject targets from another session or outside the ten-minute window."""
+        return bool(
+            self.event is not None
+            and self.message_id
+            and self.umo == umo
+            and getattr(self.event, "unified_msg_origin", "").strip() == umo
+            and 0 <= now - self.at <= 600
+        )
+
+
 # 取不到发送者名字时的兜底显示名：提示词历史行与事件侧必须同一称呼。
 FALLBACK_SENDER_NAME = "用户"
 
@@ -731,12 +754,35 @@ class SessionState:
     recent: deque[MessageRecord] = field(
         default_factory=lambda: deque(maxlen=RECENT_MESSAGE_LIMIT_DEFAULT)
     )
+    reply_targets: deque[ReplyTarget] = field(default_factory=lambda: deque(maxlen=30))
     last_active_at: float = 0.0
     last_proactive_at: float = 0.0
     last_proactive_observed_at: float = 0.0
     last_proactive_text: str = ""
     daily_key: str = field(default_factory=today_key)
     daily_count: int = 0
+    followup_sender_id: str = ""
+    followup_until: float = 0.0
+    followup_reply_at: float = 0.0
+
+    def record_followup(self, sender_id: str, at: float) -> None:
+        """Keep a short, nonpersistent conversation window after a confirmed reply."""
+        self.followup_sender_id = sender_id
+        self.followup_reply_at = at
+        self.followup_until = at + 120 if sender_id else 0.0
+
+    def is_followup(self, now: float, active_at: float | None = None) -> bool:
+        active_at = self.last_active_at if active_at is None else active_at
+        return (
+            bool(self.followup_sender_id)
+            and now <= self.followup_until
+            and any(
+                target.sender_id == self.followup_sender_id
+                and self.followup_reply_at < target.at <= self.followup_until
+                and target.at == active_at
+                for target in self.reply_targets
+            )
+        )
 
     def refresh_day(self) -> None:
         key = today_key()
@@ -862,6 +908,11 @@ _PANEL = frozenset({"host", "panel"})
 # 配置键规格表。顺序 = _conf_schema.json 顺序 = 面板呈现顺序。
 CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("enabled", "bool", True, audited=True, surfaces=_PANEL),
+    ConfigSpec("decision_backend", "enum", "chat", options=("chat", "decisions")),
+    ConfigSpec("decisions_base_url", "str", "https://api.openai.com/v1", max_len=2048),
+    ConfigSpec("decisions_api_key_env", "str", "OPENAI_API_KEY", max_len=128),
+    ConfigSpec("decisions_interests", "text", "", max_len=4000),
+    ConfigSpec("decisions_min_confidence", "float", 0.7, 0.0, 1.0, step=0.05),
     ConfigSpec("decision_model_enabled", "bool", True, surfaces=_PANEL),
     ConfigSpec(
         "judge_provider_id",
@@ -970,7 +1021,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec(
         "message_delay_sec",
         "int",
-        60,
+        30,
         5,
         86400,
         step=5,
@@ -1265,6 +1316,11 @@ def read_config_value(spec: ConfigSpec, config: Any) -> Any:
 @dataclass
 class Settings:
     enabled: bool
+    decision_backend: str
+    decisions_base_url: str
+    decisions_api_key_env: str
+    decisions_interests: str
+    decisions_min_confidence: float
     judge_provider_id: str
     decision_prompt_template: str
     decision_history_min_messages: int

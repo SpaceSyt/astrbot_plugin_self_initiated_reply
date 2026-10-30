@@ -80,6 +80,7 @@ class SessionScheduler:
         running_check_tasks: dict[str, asyncio.Task[Any]],
         background_tasks: set[asyncio.Task[Any]],
         quarantine_task: Callable[[asyncio.Task[Any], str], None] | None = None,
+        expire_reply_targets: Callable[[float], None] | None = None,
     ) -> None:
         self.settings = settings
         self._gate = gate
@@ -90,6 +91,7 @@ class SessionScheduler:
         self._check_session = check_session
         self._clear_event = clear_event
         self._drop_older_images = drop_older_images
+        self._expire_reply_targets = expire_reply_targets or (lambda _current: None)
         # 内部沿用各自的私有属性名：既有调用点与守卫（CONTAINER_HOLDERS
         # 按属性名枚举）不必跟着改。
         self._last_events = last_events
@@ -123,13 +125,20 @@ class SessionScheduler:
     # ------------------------------------------------------------------
 
     def message_trigger_delay(self) -> int:
+        if self.settings.decision_backend == "decisions":
+            return int(self.settings.message_delay_sec)
         # 触发源只剩消息静默一种：延迟不得低于静默门槛（短于静默期的检查
         # 只会反复撞「静默不足」闸门空转）。
         min_silence = max(0, int(self.settings.min_silence_sec))
         return max(int(self.settings.message_delay_sec), min_silence)
 
     def remaining_silence_sec(self, state: SessionState) -> float:
-        return state.remaining_silence_sec(self.settings.min_silence_sec, now_ts())
+        current = now_ts()
+        followup = self.settings.decision_backend == "decisions" and state.is_followup(current)
+        minimum = (
+            min(5, self.settings.min_silence_sec) if followup else self.settings.min_silence_sec
+        )
+        return state.remaining_silence_sec(minimum, current)
 
     def schedule_delayed_check(
         self,
@@ -141,7 +150,11 @@ class SessionScheduler:
         generation: int | None = None,
     ) -> None:
         if generation is None:
-            generation = self._gate.advance(umo)
+            generation = (
+                self._gate.current(umo)
+                if self.settings.decision_backend == "decisions" and not force
+                else None
+            ) or self._gate.advance(umo)
         if not self._should_run() or not self._gate.is_current(umo, generation):
             logger.debug(
                 "[%s] skip stale delayed-task registration session=%s generation=%s",
@@ -149,6 +162,17 @@ class SessionScheduler:
                 umo,
                 generation,
             )
+            return
+        pending = self._delay_tasks.get(umo)
+        if (
+            self.settings.decision_backend == "decisions"
+            and trigger == CheckTrigger.MESSAGE_DELAY
+            and not force
+            and pending is not None
+            and not pending.done()
+            and not pending.cancelling()
+            and pending is not self._running_check_tasks.get(umo)
+        ):
             return
         self.cancel_delay(umo)
         task = self._spawn(
@@ -331,12 +355,21 @@ class SessionScheduler:
         try:
             if not await self._wait_initial_delay_and_validate(umo, delay_sec, generation):
                 return
-            if not await self._wait_for_minimum_silence(
-                umo, trigger=trigger, force=force, generation=generation
-            ):
-                return
+            bounded_batch = (
+                self.settings.decision_backend == "decisions"
+                and trigger == CheckTrigger.MESSAGE_DELAY
+                and not force
+            )
+            if not bounded_batch:
+                if not await self._wait_for_minimum_silence(
+                    umo, trigger=trigger, force=force, generation=generation
+                ):
+                    return
             if not await self._wait_for_previous_check_release(umo, trigger, generation):
                 return
+            if bounded_batch and self._delay_tasks.get(umo) is asyncio.current_task():
+                # New arrivals start the next window while this snapshot is processed.
+                self._delay_tasks.pop(umo, None)
             result = await self._run_registered_check(
                 umo, trigger=trigger, force=force, generation=generation
             )
@@ -374,6 +407,7 @@ class SessionScheduler:
         """回收过期图片索引（纯内存，无磁盘 IO），返回保留窗口。"""
         image_age = self._image_age_sec()
         self._drop_older_images(current - image_age)
+        self._expire_reply_targets(current)
         return image_age
 
     def _protected_image_sources(self) -> set[str]:
@@ -557,6 +591,7 @@ class SessionScheduler:
                 await asyncio.sleep(
                     min(
                         float(EVENT_CLEANUP_INTERVAL_SEC),
+                        600.0 if self.settings.decision_backend == "decisions" else float("inf"),
                         max(float(MIN_VISION_IMAGE_AGE_SEC), image_age / 2.0),
                     )
                 )

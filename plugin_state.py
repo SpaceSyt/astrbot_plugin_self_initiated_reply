@@ -15,6 +15,7 @@ from .models import (
     ADMIN_REFRESH_WINDOW_SEC,
     PLUGIN_ID,
     MessageRecord,
+    ReplyTarget,
     SessionState,
     now_ts,
 )
@@ -25,6 +26,7 @@ from .storage import (
     write_json_atomic,
 )
 from .utils import (
+    event_message_id,
     event_sender_id,
     event_sender_name,
     whitelist_storage_key,
@@ -145,6 +147,7 @@ def append_recent_user_message(
     umo: str,
     clean_text: str,
     active_at: float | None = None,
+    capture_target: bool = False,
 ) -> float:
     """Write last_active + recent user record. Does not advance generation."""
     stamped = now_ts() if active_at is None else active_at
@@ -160,6 +163,22 @@ def append_recent_user_message(
             at=stamped,
         )
     )
+    message_id = event_message_id(event)
+    if capture_target and message_id and plugin.settings.decision_backend == "decisions":
+        # Only accepted ordinary messages reach this recorder. Targets are never persisted.
+        while state.reply_targets and stamped - state.reply_targets[0].at > 600:
+            state.reply_targets.popleft()
+        state.reply_targets.append(
+            ReplyTarget(
+                event=event,
+                message_id=message_id,
+                sender_id=sender_id,
+                text=clean_text,
+                name=event_sender_name(event),
+                umo=umo,
+                at=stamped,
+            )
+        )
     return stamped
 
 

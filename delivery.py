@@ -30,6 +30,7 @@ from .models import (
     STOPPING_REPLY_TEXT,
     AttemptLedger,
     LocalGateCallback,
+    ReplyTarget,
     SendOutcome,
     SendStatus,
     SessionState,
@@ -247,6 +248,7 @@ class DeliveryRunner:
         trigger: str,
         silence_active_at: float | None = None,
         quote: bool | None = None,
+        target: ReplyTarget | None = None,
     ) -> str:
         """发送前门卫与发送状态机；返回结果消息。记账由 pipeline 的 ledger 收口。"""
         ledger_id = ledger.ledger_id
@@ -280,12 +282,15 @@ class DeliveryRunner:
             return gate
 
         if reply:
+            if target is not None and not any(item is target for item in state.reply_targets):
+                return "选中的消息已失效。"
             sent = await self.send_reply(
                 umo,
                 reply,
                 ledger=ledger,
                 expected_generation=expected_generation,
                 quote=quote,
+                **({"target": target, "target_state": state} if target is not None else {}),
             )
             if not sent.delivered:
                 if sent.status is SendStatus.UNKNOWN:
@@ -304,6 +309,13 @@ class DeliveryRunner:
                 if not self._gate.is_current(umo, expected_generation):
                     return STALE_REPLY_MESSAGE
                 return "主动发送失败。"
+            if (
+                target is not None
+                and self.settings.decision_backend == "decisions"
+                and self._gate.is_current(umo, expected_generation)
+                and any(item is target for item in state.reply_targets)
+            ):
+                state.record_followup(target.sender_id, now_ts())
         # reply 为空（仅剩工具直发）时无需再发文本；真正的把关在 OutboundGateway：
         # 确定未提交会退还 direct_send_count，session_pipeline 的
         # `not reply and not direct_send_count` 会先行短路。
@@ -335,6 +347,8 @@ class DeliveryRunner:
         ledger: AttemptLedger | None = None,
         expected_generation: int | None = None,
         quote: bool | None = None,
+        target: ReplyTarget | None = None,
+        target_state: SessionState | None = None,
     ) -> SendOutcome:
         """Send one proactive reply without retrying an unknown submission.
 
@@ -366,13 +380,38 @@ class DeliveryRunner:
                 SuppressCode.GENERATION_CHANGED,
             )
 
-        last_event = self._last_events.get(umo)
-        quote_id = self._resolve_quote_id(umo, quote)
+        if target is not None and (
+            not target.valid_for(umo, now_ts())
+            or (
+                target_state is not None
+                and not any(item is target for item in target_state.reply_targets)
+            )
+        ):
+            return SendOutcome(
+                SendStatus.SUPPRESSED, "selected target expired", SuppressCode.GENERATION_CHANGED
+            )
+        last_event = target.event if target is not None else self._last_events.get(umo)
+        quote_id = (
+            (target.message_id if self._should_quote(quote) else "")
+            if target is not None
+            else self._resolve_quote_id(umo, quote)
+        )
         # @ 与引用同源取目标且无条件解析：短路掉会让「mention_mode=always 但
         # 事件已被回收」静默失效且无迹可查（契约 §14：context 兜底路径不 @）。
-        mention_id = self._resolve_mention_id(umo)
+        if target is not None:
+            mention_id = (
+                target.sender_id
+                if self._should_mention() and target.sender_id != event_self_id(target.event)
+                else ""
+            )
+        else:
+            mention_id = self._resolve_mention_id(umo)
         # 显示名与目标同源，都取本次依据消息的发送者；理由见 _NamedAt。
-        mention_name = event_sender_name(last_event) if mention_id and last_event else ""
+        mention_name = (
+            (target.name if target is not None else event_sender_name(last_event))
+            if mention_id and last_event
+            else ""
+        )
         if last_event:
             return await self._send_via_event(
                 umo,
@@ -383,6 +422,7 @@ class DeliveryRunner:
                 quote_id=quote_id,
                 mention_id=mention_id,
                 mention_name=mention_name,
+                **({"target": target, "target_state": target_state} if target is not None else {}),
             )
         return await self._send_via_context(
             umo,
@@ -402,6 +442,8 @@ class DeliveryRunner:
         quote_id: str = "",
         mention_id: str = "",
         mention_name: str = "",
+        target: ReplyTarget | None = None,
+        target_state: SessionState | None = None,
     ) -> SendOutcome:
         """事件路径投递：装饰钩子 → 代次复核 → 事件 send → 发送后钩子。
 
@@ -448,6 +490,19 @@ class DeliveryRunner:
                 return SendOutcome(
                     SendStatus.SUPPRESSED,
                     "generation changed after decorating",
+                    SuppressCode.GENERATION_CHANGED,
+                )
+            if target is not None and (
+                not target.valid_for(umo, now_ts())
+                or (
+                    target_state is not None
+                    and not any(item is target for item in target_state.reply_targets)
+                )
+            ):
+                self._clear_result(last_event)
+                return SendOutcome(
+                    SendStatus.SUPPRESSED,
+                    "selected target expired during decorating",
                     SuppressCode.GENERATION_CHANGED,
                 )
             result = last_event.get_result()

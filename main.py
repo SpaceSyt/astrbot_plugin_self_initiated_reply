@@ -50,6 +50,7 @@ from .commands import (
     dispatch_command_action,
     help_text,
 )
+from .continuation import record_normal_reply
 from .decision import DECISION_MAX_TOKENS, DECISION_SYSTEM_PROMPT, DecisionMaker
 from .delivery import DeliveryRunner
 from .generation import GenerationRunner
@@ -279,6 +280,7 @@ class SelfInitiatedReplyPlugin(Star):
             gate=self._gate,
             cancel_delay=lambda umo, force: self._scheduler.cancel_delay(umo, force=force),
             notify_silence=lambda umo: self._scheduler.notify_activity(umo),
+            sessions=self.sessions,
         )
         self._vision = VisionService(
             settings=self.settings,
@@ -308,6 +310,7 @@ class SelfInitiatedReplyPlugin(Star):
             ),
             clear_event=self._coordinator.clear_event,
             drop_older_images=self._coordinator.drop_older_than,
+            expire_reply_targets=self._coordinator.expire_reply_targets,
             last_events=self._last_events,
             last_event_at=self._last_event_at,
             last_decisions=self._last_decisions,
@@ -550,6 +553,11 @@ class SelfInitiatedReplyPlugin(Star):
     async def on_message(self, event: AstrMessageEvent) -> None:
         """事件监听器：收集白名单会话消息，驱动主动回复的判断与调度。"""
         await handle_incoming_message(self, event)
+
+    @filter.after_message_sent()
+    async def on_normal_reply_sent(self, event: AstrMessageEvent) -> None:
+        """Keep direct replies available to the next ordinary-message decision."""
+        record_normal_reply(self, event)
 
     @staticmethod
     def _is_command_entry(event: AstrMessageEvent, text: str) -> bool:

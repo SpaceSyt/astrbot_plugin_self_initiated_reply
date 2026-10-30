@@ -101,6 +101,8 @@ def install_astrbot_stubs() -> None:
         event_filter.event_message_type = _passthrough_decorator
     if not hasattr(event_filter, "platform_adapter_type"):
         event_filter.platform_adapter_type = _passthrough_decorator
+    if not hasattr(event_filter, "after_message_sent"):
+        event_filter.after_message_sent = _passthrough_decorator
     if not hasattr(event_filter, "command_group"):
         event_filter.command_group = _command_group
     if not hasattr(event_filter, "PermissionType"):

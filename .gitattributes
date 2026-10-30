@@ -2,7 +2,6 @@
 # 被 .gitignore 排除的开发物天然不进包，此处再排除对部署无意义的仓库内容。
 # 发布命令见 docs/DECISIONS.md「发布产物」。
 tests/ export-ignore
-docs/ export-ignore
 scripts/ export-ignore
 .github/ export-ignore
 assets/ export-ignore

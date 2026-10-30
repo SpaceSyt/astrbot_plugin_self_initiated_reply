@@ -66,19 +66,21 @@ def _accepted_content(
     )
     empty = not clean_text and not has_images
     if ignored or empty:
-        # 语义单点：任何被入口接住的消息（含被忽略与空内容）都推进代次，作废
-        # 未发出的旧回复（契约 §6.3）。**只推进代次**：同函数的正常消息路径
-        # 也仅 advance，而 ``invalidate`` 会级联 ``clear_session``，把保护窗口内
-        # 的图片索引与最近事件一并抹掉（契约 §8 只允许白名单移除/命令失效/
-        # 终止这样做）。那会让一条表情包或一次 @Bot 就把刚发的图从识图上下文
-        # 里删掉，并让巡检因「没有可用的最近消息事件」静默跳过该会话。
-        # 在途延迟检查不在这里取消：它会在下一道代次闸门自行退出。
-        if plugin.settings.abandon_stale_on_new_message:
+        # Chat mode may discard a pending response on new activity. Decisions
+        # keeps its fixed batch; only a direct call supersedes that batch below.
+        if (
+            plugin.settings.decision_backend != "decisions"
+            and plugin.settings.abandon_stale_on_new_message
+        ):
             plugin._gate.advance(umo)
     if ignored:
         if not is_self_message(event) and is_explicit_direct_call(event, text):
+            if plugin.settings.decision_backend == "decisions":
+                plugin._gate.advance(umo)
+                plugin._scheduler.cancel_delay(umo)
             state = plugin._state_for(umo)
             state.last_active_at = now_ts()
+            state.reply_targets.clear()
             if plugin.settings.skip_after_direct_call:
                 # 这条 @Bot/唤醒消息由 AstrBot 正常回复，记为「这条消息之后
                 # Bot 已经回应过」：避免"刚被点名答过、静默时间一到又主动接一句"。
@@ -96,7 +98,10 @@ def _record_message(
     umo: str,
     clean_text: str,
 ) -> tuple[int, float]:
-    if plugin.settings.abandon_stale_on_new_message or not plugin._gate.current(umo):
+    if (
+        plugin.settings.decision_backend != "decisions"
+        and plugin.settings.abandon_stale_on_new_message
+    ) or not plugin._gate.current(umo):
         generation = plugin._gate.advance(umo)
     else:
         generation = plugin._gate.current(umo)
@@ -105,6 +110,7 @@ def _record_message(
         event,
         umo=umo,
         clean_text=clean_text,
+        capture_target=True,
     )
     plugin._coordinator.record_event(umo, event, active_at)
     return generation, active_at
@@ -141,9 +147,12 @@ def _schedule_message_check(plugin: SelfInitiatedReplyPlugin, umo: str, generati
     if not plugin.settings.enabled_message_trigger:
         return
     trigger = CheckTrigger.MESSAGE_DELAY
+    followup = plugin.settings.decision_backend == "decisions" and plugin._state_for(
+        umo
+    ).is_followup(now_ts())
     plugin._scheduler.schedule_delayed_check(
         umo,
-        delay_sec=plugin._scheduler.message_trigger_delay(),
+        delay_sec=5 if followup else plugin._scheduler.message_trigger_delay(),
         trigger=trigger,
         force=False,
         generation=generation,
@@ -175,6 +184,8 @@ async def handle_incoming_message(
         umo=umo,
         clean_text=clean_text,
     )
+    if plugin.settings.decision_backend == "decisions":
+        _schedule_message_check(plugin, umo, generation)
     if has_images:
         try:
             await _capture_images(
@@ -194,4 +205,5 @@ async def handle_incoming_message(
                 redact_exc_text(exc),
             )
     plugin._scheduler.cleanup_events_if_needed()
-    _schedule_message_check(plugin, umo, generation)
+    if plugin.settings.decision_backend != "decisions":
+        _schedule_message_check(plugin, umo, generation)

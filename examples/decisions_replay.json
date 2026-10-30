@@ -1,0 +1,25 @@
+{
+  "interests": "喜欢讨论游戏配乐，倾向简短随和地交流。别人已经回答的问题不重复回答。",
+  "messages": [
+    {"id": "-101", "text": "最近在听一个游戏的原声，钢琴部分很好听。", "name": "小林", "sender_id": "user_a", "at": 1000},
+    {"id": "102", "text": "我最近也在找这种配乐，有推荐吗？", "name": "小陈", "sender_id": "user_b", "at": 1002},
+    {"id": "103", "text": "等我找一下歌单。", "name": "小林", "sender_id": "user_a", "at": 1004}
+  ],
+  "response": {
+    "model": "gpt-6-luna",
+    "answers": [{
+      "type": "choice",
+      "name": "reply_target",
+      "choice": "wait",
+      "confidence": 0.92,
+      "probabilities": [
+        {"value": "ignore", "probability": 0.03},
+        {"value": "wait", "probability": 0.90},
+        {"value": "reply:-101", "probability": 0.02},
+        {"value": "reply:102", "probability": 0.04},
+        {"value": "reply:103", "probability": 0.01}
+      ]
+    }],
+    "usage": {"input_tokens": 200, "output_tokens": 0, "total_tokens": 200}
+  }
+}

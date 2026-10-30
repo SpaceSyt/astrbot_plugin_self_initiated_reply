@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -15,6 +16,7 @@ from typing import Any
 
 from astrbot.api import logger
 
+from .decisions_client import DecisionsClient
 from .models import (
     CONTEXT_CAP_MARKER,
     DECISION_HISTORY_FLOOR,
@@ -136,6 +138,7 @@ class DecisionMaker:
         *,
         force: bool,
         silence_active_at: float | None = None,
+        checking: bool = False,
     ) -> str:
         if force:
             return ""
@@ -152,16 +155,26 @@ class DecisionMaker:
             # 从未活跃与"静默中"是两回事：无活动记录连判定基线都没有，
             # 沿用"静默不足"文案会误导运营以为配置没生效。
             return "会话暂无活动记录，无法判断静默。"
-        silence_left = state.remaining_silence_sec(
-            self.settings.min_silence_sec, self._clock(), active_at=active_for_silence
+        followup = self.settings.decision_backend == "decisions" and state.is_followup(
+            self._clock(), active_for_silence
         )
-        if silence_left > 0:
+        minimum_silence = (
+            min(5, self.settings.min_silence_sec) if followup else self.settings.min_silence_sec
+        )
+        silence_left = state.remaining_silence_sec(
+            minimum_silence, self._clock(), active_at=active_for_silence
+        )
+        if silence_left > 0 and self.settings.decision_backend != "decisions":
             # max(0, ...)：载入时时间戳被钳到 now + MAX_CLOCK_SKEW_SEC，
             # 差值可能为负，不能向运营者显示负的剩余静默。
-            elapsed = max(0, int(self.settings.min_silence_sec - silence_left))
-            return f"静默时间不足：{elapsed}s / {self.settings.min_silence_sec}s。"
+            elapsed = max(0, int(minimum_silence - silence_left))
+            return f"静默时间不足：{elapsed}s / {minimum_silence}s。"
         cooldown_left = self.settings.cooldown_sec - (self._clock() - state.last_proactive_at)
-        if cooldown_left >= 1:
+        if (
+            cooldown_left >= 1
+            and not followup
+            and not (checking and self.settings.decision_backend == "decisions")
+        ):
             # 不足整秒直接放行：亚秒剩余在文案上等于「还剩 0s」，语义矛盾。
             return f"冷却中：还剩 {duration(cooldown_left)}。"
         if state.last_proactive_observed_at >= state.last_active_at:
@@ -234,6 +247,137 @@ class DecisionMaker:
     # 判断模型调用（超时/失败分类；文案冻结于行为契约 §7）
     # ------------------------------------------------------------------
 
+    async def _ask_decisions(self, umo: str, state: SessionState) -> dict[str, Any]:
+        """Choose a captured message without invoking host models or hooks."""
+        started = self._clock()
+        result: dict[str, Any] = {
+            "should_reply": False,
+            "reason": "decisions_not_ready",
+            "elapsed_sec": 0.0,
+        }
+        if not self.settings.decision_model_enabled:
+            result["reason"] = "decisions_disabled"
+            return result
+        if not self.settings.decisions_interests.strip():
+            result["reason"] = "decisions_missing_interests"
+            return result
+        api_key = os.getenv(self.settings.decisions_api_key_env, "").strip()
+        if not api_key:
+            result["reason"] = "decisions_missing_api_key"
+            return result
+
+        # Capture before the first await. New messages must not change the mapping
+        # between an API choice and the event used by generation and delivery.
+        followup = state.is_followup(started)
+        targets = {
+            f"m{index}": target
+            for index, target in enumerate(tuple(state.reply_targets))
+            if target.valid_for(umo, started)
+            and target.at > state.last_proactive_observed_at
+            and (
+                not followup
+                or (
+                    target.sender_id == state.followup_sender_id
+                    and state.followup_reply_at < target.at <= state.followup_until
+                )
+            )
+        }
+        if not targets:
+            result["reason"] = "decisions_no_candidates"
+            return result
+        messages = []
+        represented: set[str] = set()
+        for index, record in enumerate(tuple(state.recent)[-30:]):
+            if not 0 <= started - record.at <= 600:
+                continue
+            candidate_id = next(
+                (
+                    key
+                    for key, target in targets.items()
+                    if key not in represented
+                    and target.at == record.at
+                    and target.sender_id == record.sender_id
+                    and target.text == record.text
+                    and record.role == "user"
+                ),
+                None,
+            )
+            if candidate_id is not None:
+                represented.add(candidate_id)
+            messages.append(
+                {
+                    "id": candidate_id or f"background{index}",
+                    "text": record.text[:600],
+                    "name": record.name,
+                    "sender_id": record.sender_id,
+                    "at": record.at,
+                    "eligible": candidate_id is not None,
+                    "role": record.role,
+                }
+            )
+        if not represented:
+            result["reason"] = "decisions_no_recent_candidates"
+            return result
+
+        client = None
+        try:
+            client = DecisionsClient(
+                api_key,
+                base_url=self.settings.decisions_base_url,
+                timeout=self.settings.decision_timeout_sec,
+            )
+            async with asyncio.timeout(self.settings.decision_timeout_sec):
+                answer = await client.decide(
+                    messages=messages,
+                    interests=(
+                        (
+                            "\nContinuation window: reply only if an eligible message naturally "
+                            "continues the character's recent exchange. A follow-up question or "
+                            "reaction needs no mention or repeated name "
+                            "and need not match a hobby. "
+                            "If the speaker has moved to an unrelated exchange, ignore or wait."
+                            if followup
+                            else ""
+                        )
+                        + "\n"
+                        + self.settings.decisions_interests
+                    )[:4000],
+                    min_confidence=self.settings.decisions_min_confidence,
+                )
+            result.update(
+                reason=f"decisions_{answer['action']}_{answer['reason_code']}",
+                confidence=answer["confidence"],
+                usage=answer["usage"],
+            )
+            selected = targets.get(answer.get("target_id"))
+            if answer["action"] == "reply" and selected is not None:
+                if selected.valid_for(umo, self._clock()) and any(
+                    candidate is selected for candidate in state.reply_targets
+                ):
+                    result.update(should_reply=True, target=selected, quote=True)
+                else:
+                    result["reason"] = "decisions_stale_target"
+            logger.info(
+                "[%s] Decisions result=%s confidence=%s usage=%s followup=%s",
+                PLUGIN_ID,
+                result["reason"],
+                result.get("confidence"),
+                result.get("usage"),
+                followup,
+            )
+        except TimeoutError:
+            result["reason"] = "decisions_timeout"
+        except Exception as exc:
+            # Request errors can contain bearer tokens and URLs. Only the class
+            # is diagnostic here; never forward the exception body to chat/logs.
+            result["reason"] = "decisions_error"
+            logger.warning("[%s] Decisions failed (%s)", PLUGIN_ID, type(exc).__name__)
+        finally:
+            if client is not None:
+                await client.aclose()
+            result["elapsed_sec"] = self._clock() - started
+        return result
+
     async def ask_decision_model(
         self, umo: str, state: SessionState, *, trigger: str
     ) -> dict[str, Any]:
@@ -248,6 +392,8 @@ class DecisionMaker:
         每条出口都带 elapsed_sec，异常路径也不例外。
         """
         started = self._clock()
+        if self.settings.decision_backend == "decisions":
+            return await self._ask_decisions(umo, state)
         if not self.settings.decision_model_enabled:
             if trigger == CheckTrigger.PATROL:
                 return {

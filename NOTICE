@@ -1,0 +1,13 @@
+Decisions proactive reply for AstrBot
+
+Based on chengzhi-c's Yejing:
+https://github.com/chengzhi-c/astrbot_plugin_self_initiated_reply
+Base version: 1.5.1, commit 11be820.
+
+Modified by SpaceSyt on 2026-10-29.
+Changes include an OpenAI Decisions API client, message-target selection,
+fixed message batching, conversation continuation, tests and documentation.
+
+The original authors' copyright and license notices are retained.
+This derivative work is distributed under GNU GPL version 3; see LICENSE.
+This is an independent experimental fork, not an official upstream or OpenAI release.

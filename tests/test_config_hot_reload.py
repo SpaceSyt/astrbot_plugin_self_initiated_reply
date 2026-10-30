@@ -269,6 +269,7 @@ CONTAINER_HOLDERS: tuple[tuple[str, str, str], ...] = (
     ("_last_decisions", "_pipeline", "_last_decisions"),
     ("_last_events", "_pipeline", "_last_events"),
     ("sessions", "_whitelist", "_sessions"),
+    ("sessions", "_coordinator", "_sessions"),
 )
 
 

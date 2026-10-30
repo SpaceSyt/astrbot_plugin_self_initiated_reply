@@ -21,10 +21,12 @@ from .models import (
     MAX_IMAGE_MEMORY_BYTES,
     MAX_SESSION_IMAGE_MEMORY_BYTES,
     PLUGIN_ID,
+    SessionState,
     now_ts,
     restore_container_inplace,
 )
 from .session_gate import SessionGate
+from .utils import whitelist_storage_key
 
 
 def _prepared_memory_size(image: Any) -> int:
@@ -59,6 +61,7 @@ class SessionCoordinator:
         notify_silence: Callable[[str], None],
         max_image_memory_bytes: int = MAX_IMAGE_MEMORY_BYTES,
         max_session_image_memory_bytes: int = MAX_SESSION_IMAGE_MEMORY_BYTES,
+        sessions: dict[str, SessionState] | None = None,
     ) -> None:
         self._events = last_events
         self._event_at = last_event_at
@@ -66,6 +69,7 @@ class SessionCoordinator:
         self._gate = gate
         self._cancel_delay = cancel_delay
         self._notify_silence = notify_silence
+        self._sessions = sessions if sessions is not None else {}
         self._max_image_memory_bytes = max(0, int(max_image_memory_bytes))
         self._max_session_image_memory_bytes = max(0, int(max_session_image_memory_bytes))
         self._session_bytes: dict[str, int] = {}
@@ -252,6 +256,19 @@ class SessionCoordinator:
                 return
         self._events.pop(umo, None)
         self._event_at.pop(umo, None)
+        state = self._sessions.get(whitelist_storage_key(umo))
+        if state is not None:
+            state.reply_targets.clear()
+            state.record_followup("", 0.0)
+
+    def expire_reply_targets(self, current: float) -> None:
+        """Release expired event references, including sessions with no new messages."""
+        for state in self._sessions.values():
+            retained = [
+                target for target in state.reply_targets if target.valid_for(target.umo, current)
+            ]
+            state.reply_targets.clear()
+            state.reply_targets.extend(retained)
 
     def clear_session(self, umo: str) -> None:
         """清理会话全部协作资源，供失效、移除和终止路径使用。"""
@@ -266,6 +283,9 @@ class SessionCoordinator:
         self._images.clear()
         self._session_bytes.clear()
         self._total_bytes = 0
+        for state in self._sessions.values():
+            state.reply_targets.clear()
+            state.record_followup("", 0.0)
 
     def snapshot(self) -> dict[str, Any]:
         """复制三张协作表，供配置回滚。容器身份仍由 restore_inplace 保持。"""

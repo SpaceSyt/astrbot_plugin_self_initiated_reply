@@ -568,7 +568,7 @@
               <span>新消息到达时放弃未发出的旧回复</span>
             </label>
             <p class="muted">
-              默认关闭。开启后，同一会话里任何新消息都会让正在生成、尚未发出的主动回复作废（包括表情包、单独符号）。关闭后旧回复仍会发出，新消息只刷新延迟与下一轮静默计时。白名单移除、手动检查和插件停止仍会作废旧任务。
+              仅 chat 判断接口生效。Decisions 按固定窗口处理，普通新消息不会推迟判断；@、唤醒、移除白名单和停止仍会使旧任务失效。
             </p>
             <label class="toggle-row">
               <input
@@ -595,14 +595,12 @@
                   <use href="#i-clock" /></svg
                 >触发条件
               </h2>
-              <span class="muted">四个阈值互不影响，各自独立生效</span>
             </div>
 
             <div class="origin-groups">
               <fieldset class="origin">
                 <legend class="origin-head">
-                  <span class="origin-title">自最近一条消息起算</span>
-                  <code>last_message_age_sec</code>
+                  <span class="origin-title">消息等待</span>
                 </legend>
                 <div class="field-grid">
                   <label class="field">
@@ -618,7 +616,7 @@
                       aria-describedby="messageDelayHint"
                     />
                     <p class="field-hint" id="messageDelayHint">
-                      消息后等待多久才开口，建议 30-120 秒
+                      Decisions 从首条待处理消息计时，后续消息不重置；默认 30 秒到点判断，可保持沉默。chat 按最后一条消息延迟。
                     </p>
                   </label>
                   <label class="field">
@@ -633,7 +631,7 @@
                       step="10"
                       aria-describedby="minSilenceHint"
                     />
-                    <p class="field-hint" id="minSilenceHint">连续静默多久才允许触发；设为 0 表示不要求静默</p>
+                    <p class="field-hint" id="minSilenceHint">仅 chat 生效；Decisions 不等待群聊静默</p>
                   </label>
                 </div>
               </fieldset>
