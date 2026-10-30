@@ -273,6 +273,10 @@ async def save_storage(plugin: SelfInitiatedReplyPlugin) -> None:
                     success = await asyncio.shield(write_task)
                     break
                 except asyncio.CancelledError:
+                    # Runner shutdown can cancel both this task and its worker.
+                    # Repeated shielding cannot recover an already cancelled task.
+                    if write_task.cancelled():
+                        raise
                     continue
             if not success and not abandoned():
                 logger.warning(

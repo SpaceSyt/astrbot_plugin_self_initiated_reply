@@ -455,6 +455,10 @@ async def apersist_settings_config(path: Path, config_obj: Any, settings: Settin
                 success = await asyncio.shield(write_task)
                 break
             except asyncio.CancelledError:
+                # A cancelled worker cannot converge; shielding it again raises
+                # immediately and would starve the event loop during shutdown.
+                if write_task.cancelled():
+                    raise
                 continue
         raise
     if not success:
